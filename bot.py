@@ -24,6 +24,9 @@ TIP_WEB_URL = "https://www.threat.rip/file/{}"
 MAX_FILE_SIZE = 100 * 1024 * 1024
 MAX_TG_FILE_SIZE = 20 * 1024 * 1024
 
+# Таймер ожидания отчета (5 минут)
+WAIT_TIME_SECONDS = 300  # 5 минут
+
 TEMP_DIR = os.path.expanduser("~/threat_bot_temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -93,7 +96,7 @@ def scanner_keyboard():
     ])
     return keyboard
 
-def result_keyboard(file_hash: str, is_ready: bool):
+def result_keyboard(file_hash: str, is_ready: bool, remaining_seconds: int = 0):
     if is_ready:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📊 Детекты", callback_data="get_detects"),
@@ -101,8 +104,15 @@ def result_keyboard(file_hash: str, is_ready: bool):
             [InlineKeyboardButton(text="🔄 Новое сканирование", callback_data="scanner")]
         ])
     else:
+        if remaining_seconds > 0:
+            minutes = remaining_seconds // 60
+            seconds = remaining_seconds % 60
+            wait_text = f"⏳ Готово через {minutes}м {seconds}с"
+        else:
+            wait_text = "🔄 Проверить готовность"
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Проверить готовность", callback_data="check_ready")],
+            [InlineKeyboardButton(text=wait_text, callback_data="check_ready")],
             [InlineKeyboardButton(text="🔄 Новое сканирование", callback_data="scanner")]
         ])
     return keyboard
@@ -120,12 +130,19 @@ def check_report_ready(file_hash: str) -> bool:
     except:
         return False
 
+def get_time_remaining(upload_time: float) -> int:
+    """Возвращает оставшиеся секунды до готовности отчета"""
+    elapsed = time.time() - upload_time
+    remaining = WAIT_TIME_SECONDS - elapsed
+    return max(0, int(remaining))
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать в сканер CoreDebuging!\n\n"
         "🔍 Я помогу проанализировать файлы\n"
         "📊 Получай детекты антивирусов и извлекай конфигурации\n\n"
+        "⏱️ Отчет формируется в течение 5 минут после загрузки\n\n"
         "👇 Выбери способ отправки файла:",
         reply_markup=scanner_keyboard()
     )
@@ -148,6 +165,7 @@ async def process_scanner(callback: types.CallbackQuery, state: FSMContext):
         "📤 Отправьте файл для сканирования\n\n"
         "📁 Максимальный размер: 20 МБ\n"
         "📄 Поддерживаются: exe, dll, pdf, doc, zip, rar и другие\n\n"
+        "⏱️ Анализ займет 5 минут\n\n"
         "Просто отправьте файл в этот чат."
     )
     user_states[callback.from_user.id] = 'waiting_for_file'
@@ -172,15 +190,14 @@ async def process_scanner_url(callback: types.CallbackQuery, state: FSMContext):
         "   Пример: https://www.dropbox.com/s/...?dl=1\n\n"
         "📌 Для Google Drive: используйте публичную ссылку\n\n"
         "📌 Для других сервисов: прямая ссылка на файл\n\n"
-        "📁 Максимальный размер: 100 МБ\n\n"
+        "📁 Максимальный размер: 100 МБ\n"
+        "⏱️ Анализ займет 5 минут\n\n"
         "Пример: https://example.com/file.exe"
     )
     user_states[callback.from_user.id] = 'waiting_for_url'
 
 @dp.callback_query(F.data == "check_ready")
 async def check_ready(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer("🔍 Проверяю готовность...")
-    
     user_id = callback.from_user.id
     report_data = user_reports.get(user_id)
     
@@ -188,14 +205,24 @@ async def check_ready(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Нет активного файла", show_alert=True)
         return
     
-    file_hash = report_data['hash']
+    upload_time = report_data.get('upload_time', 0)
+    remaining = get_time_remaining(upload_time)
     
-    last_check = report_data.get('last_check', 0)
-    if time.time() - last_check < 30:
-        await callback.answer("⏳ Подождите 30 секунд перед следующей проверкой", show_alert=True)
+    # Если еще не прошло 5 минут
+    if remaining > 0:
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await callback.answer(f"⏳ Отчет будет готов через {minutes}м {seconds}с. Пожалуйста, подождите.", show_alert=True)
+        
+        # Обновляем клавиатуру с актуальным таймером
+        await callback.message.edit_reply_markup(
+            reply_markup=result_keyboard(report_data['hash'], False, remaining)
+        )
         return
     
-    user_reports[user_id]['last_check'] = time.time()
+    # Если 5 минут прошло - проверяем готовность отчета
+    file_hash = report_data['hash']
+    await callback.answer("🔍 Проверяю готовность отчета...")
     
     if check_report_ready(file_hash):
         user_reports[user_id]['ready'] = True
@@ -208,16 +235,35 @@ async def check_ready(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=result_keyboard(file_hash, True)
         )
     else:
-        await callback.answer("⏳ Отчет еще не готов. Попробуйте через 1-2 минуты", show_alert=True)
+        await callback.answer("⚠️ Отчет все еще формируется. Попробуйте через 1-2 минуты.", show_alert=True)
 
 @dp.callback_query(F.data == "get_detects")
 async def get_detects(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     report_data = user_reports.get(user_id)
     
-    if not report_data or not report_data.get('ready'):
-        await callback.answer("❌ Отчет еще не готов! Нажмите 'Проверить готовность'", show_alert=True)
+    if not report_data:
+        await callback.answer("❌ Нет активного файла", show_alert=True)
         return
+    
+    # Проверяем, прошло ли 5 минут
+    upload_time = report_data.get('upload_time', 0)
+    remaining = get_time_remaining(upload_time)
+    
+    if remaining > 0:
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await callback.answer(f"⏳ Отчет будет готов через {minutes}м {seconds}с. Пожалуйста, подождите.", show_alert=True)
+        return
+    
+    if not report_data.get('ready'):
+        # Пробуем проверить еще раз
+        file_hash = report_data['hash']
+        if check_report_ready(file_hash):
+            report_data['ready'] = True
+        else:
+            await callback.answer("❌ Отчет еще не готов! Нажмите 'Проверить готовность' через минуту", show_alert=True)
+            return
     
     file_hash = report_data['hash']
     api_url = TIP_REPORT_URL.format(file_hash)
@@ -292,9 +338,27 @@ async def get_config(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     report_data = user_reports.get(user_id)
     
-    if not report_data or not report_data.get('ready'):
-        await callback.answer("❌ Отчет еще не готов! Нажмите 'Проверить готовность'", show_alert=True)
+    if not report_data:
+        await callback.answer("❌ Нет активного файла", show_alert=True)
         return
+    
+    # Проверяем, прошло ли 5 минут
+    upload_time = report_data.get('upload_time', 0)
+    remaining = get_time_remaining(upload_time)
+    
+    if remaining > 0:
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await callback.answer(f"⏳ Отчет будет готов через {minutes}м {seconds}с. Пожалуйста, подождите.", show_alert=True)
+        return
+    
+    if not report_data.get('ready'):
+        file_hash = report_data['hash']
+        if check_report_ready(file_hash):
+            report_data['ready'] = True
+        else:
+            await callback.answer("❌ Отчет еще не готов! Нажмите 'Проверить готовность' через минуту", show_alert=True)
+            return
     
     file_hash = report_data['hash']
     config_url = TIP_CONFIG_URL.format(file_hash)
@@ -456,20 +520,31 @@ async def handle_messages(message: types.Message, state: FSMContext):
                 await status_msg.edit_text("❌ Не удалось получить хеш")
                 return
             
+            upload_time = time.time()
+            
             user_reports[user_id] = {
                 'hash': file_hash,
                 'filename': document.file_name,
                 'ready': False,
-                'last_check': 0
+                'upload_time': upload_time
             }
             
-            await status_msg.edit_text(
+            # Формируем сообщение
+            result_text = (
                 f"✅ Файл загружен, ожидайте анализа\n\n"
                 f"📄 Файл: {document.file_name}\n"
                 f"🔑 SHA256: {file_hash[:16]}...{file_hash[-16:]}\n\n"
-                f"🔄 Анализ занимает 1-5 минут.\n"
-                f"Нажмите 'Проверить готовность' когда отчет появится",
-                reply_markup=result_keyboard(file_hash, False)
+                f"⏱️ Отчет будет готов через 5 минут\n"
+                f"Нажмите 'Проверить готовность' после истечения таймера"
+            )
+            
+            # Для админа сразу показываем ссылку на отчет
+            if user_id == ADMIN_ID:
+                result_text += f"\n\n🔗 Ссылка на отчет (для администратора):\n{TIP_WEB_URL.format(file_hash)}"
+            
+            await status_msg.edit_text(
+                result_text,
+                reply_markup=result_keyboard(file_hash, False, WAIT_TIME_SECONDS)
             )
             
         except Exception as e:
@@ -503,20 +578,31 @@ async def handle_messages(message: types.Message, state: FSMContext):
                 await status_msg.edit_text("❌ Не удалось получить хеш")
                 return
             
+            upload_time = time.time()
+            
             user_reports[user_id] = {
                 'hash': file_hash,
                 'filename': filename,
                 'ready': False,
-                'last_check': 0
+                'upload_time': upload_time
             }
             
-            await status_msg.edit_text(
+            # Формируем сообщение
+            result_text = (
                 f"✅ Файл загружен, ожидайте анализа\n\n"
                 f"📄 Файл: {filename}\n"
                 f"🔑 SHA256: {file_hash[:16]}...{file_hash[-16:]}\n\n"
-                f"🔄 Анализ занимает 1-5 минут.\n"
-                f"Нажмите 'Проверить готовность' когда отчет появится",
-                reply_markup=result_keyboard(file_hash, False)
+                f"⏱️ Отчет будет готов через 5 минут\n"
+                f"Нажмите 'Проверить готовность' после истечения таймера"
+            )
+            
+            # Для админа сразу показываем ссылку на отчет
+            if user_id == ADMIN_ID:
+                result_text += f"\n\n🔗 Ссылка на отчет (для администратора):\n{TIP_WEB_URL.format(file_hash)}"
+            
+            await status_msg.edit_text(
+                result_text,
+                reply_markup=result_keyboard(file_hash, False, WAIT_TIME_SECONDS)
             )
             
         except Exception as e:
